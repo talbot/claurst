@@ -272,9 +272,9 @@ fn decode_png(data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
     use image::ImageReader;
     use std::io::Cursor;
 
-    // Decode the PNG using the image crate
+    // Decode the PNG using the image crate with explicit format hint
     let reader = ImageReader::new(Cursor::new(data))
-        .map_err(|e| format!("Failed to identify PNG: {}", e))?;
+        .with_guessed_format()?;
     let image = reader.decode()
         .map_err(|e| format!("Failed to decode PNG: {}", e))?;
 
@@ -298,9 +298,9 @@ fn decode_jpeg(data: &[u8]) -> Result<ImageData, Box<dyn std::error::Error>> {
     use image::ImageReader;
     use std::io::Cursor;
 
-    // Decode the JPEG using the image crate
+    // Decode the JPEG using the image crate with explicit format hint
     let reader = ImageReader::new(Cursor::new(data))
-        .map_err(|e| format!("Failed to identify JPEG: {}", e))?;
+        .with_guessed_format()?;
     let image = reader.decode()
         .map_err(|e| format!("Failed to decode JPEG: {}", e))?;
 

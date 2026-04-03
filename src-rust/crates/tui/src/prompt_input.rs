@@ -1277,6 +1277,8 @@ pub struct PromptInputState {
     pub vim_quit_requested: bool,
     /// Pending image attachments (from clipboard paste) to be sent with next message.
     pub pending_images: Vec<crate::image_paste::PastedImage>,
+    /// Emacs-style kill ring for Ctrl+K, Ctrl+U, Ctrl+W operations.
+    pub kill_ring: KillRing,
 }
 
 impl PromptInputState {
@@ -1311,6 +1313,7 @@ impl PromptInputState {
             vim_search_last: None,
             vim_quit_requested: false,
             pending_images: Vec::new(),
+            kill_ring: KillRing::new(),
         }
     }
 
@@ -1432,6 +1435,220 @@ impl PromptInputState {
             self.cursor += c.len_utf8();
         }
         self.update_token_estimate();
+        self.kill_ring.mark_non_kill();
+    }
+
+    /// Ctrl+K: Cut from cursor to end of line and save to kill ring.
+    pub fn kill_line(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        let line_end = self.text[self.cursor..].find('\n')
+            .map(|p| self.cursor + p)
+            .unwrap_or(self.text.len());
+
+        if line_end > self.cursor {
+            let killed = self.text.drain(self.cursor..line_end).collect::<String>();
+            self.kill_ring.push(killed);
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+U: Cut from line start to cursor and save to kill ring.
+    pub fn kill_line_backward(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        let line_start = self.text[..self.cursor].rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+
+        if self.cursor > line_start {
+            let killed = self.text.drain(line_start..self.cursor).collect::<String>();
+            self.kill_ring.push(killed);
+            self.cursor = line_start;
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+W: Cut previous word and save to kill ring.
+    pub fn kill_word_backward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        let kill_start = char_idx_to_byte(before, idx);
+        if kill_start < self.cursor {
+            let killed = self.text.drain(kill_start..self.cursor).collect::<String>();
+            self.kill_ring.push(killed);
+            self.cursor = kill_start;
+            self.update_token_estimate();
+        }
+    }
+
+    /// Ctrl+Y: Paste from kill ring (most recent).
+    pub fn yank(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        if let Some(text) = self.kill_ring.get_current() {
+            for c in text.chars() {
+                self.text.insert(self.cursor, c);
+                self.cursor += c.len_utf8();
+            }
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+Y: Cycle through kill ring backward.
+    pub fn yank_pop(&mut self) {
+        if self.mode == InputMode::Readonly { return; }
+        self.kill_ring.cycle_backward();
+    }
+
+    /// Alt+Backspace: Delete word backward.
+    pub fn delete_word_backward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        let delete_start = char_idx_to_byte(before, idx);
+        if delete_start < self.cursor {
+            self.text.drain(delete_start..self.cursor);
+            self.cursor = delete_start;
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+Delete: Delete word forward.
+    pub fn delete_word_forward(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            return;
+        }
+        if is_word_char(chars[idx]) {
+            while idx < chars.len() && is_word_char(chars[idx]) {
+                idx += 1;
+            }
+        } else {
+            while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+        }
+        let delete_end = self.cursor + char_idx_to_byte(rest, idx);
+        if delete_end > self.cursor {
+            self.text.drain(self.cursor..delete_end);
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
+    }
+
+    /// Alt+B: Jump to previous word.
+    pub fn move_word_backward(&mut self) {
+        if self.cursor == 0 { return; }
+        let before = &self.text[..self.cursor];
+        let chars: Vec<char> = before.chars().collect();
+        let mut idx = chars.len();
+        while idx > 0 && chars[idx - 1].is_whitespace() {
+            idx -= 1;
+        }
+        if idx == 0 {
+            return;
+        }
+        if is_word_char(chars[idx - 1]) {
+            while idx > 0 && is_word_char(chars[idx - 1]) {
+                idx -= 1;
+            }
+        } else {
+            while idx > 0 && !is_word_char(chars[idx - 1]) && !chars[idx - 1].is_whitespace() {
+                idx -= 1;
+            }
+        }
+        self.cursor = char_idx_to_byte(before, idx);
+    }
+
+    /// Alt+F: Jump to next word.
+    pub fn move_word_forward(&mut self) {
+        if self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        if idx < chars.len() {
+            if is_word_char(chars[idx]) {
+                while idx < chars.len() && is_word_char(chars[idx]) {
+                    idx += 1;
+                }
+            } else if !chars[idx].is_whitespace() {
+                while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                    idx += 1;
+                }
+            }
+        }
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        self.cursor = self.cursor + char_idx_to_byte(rest, idx);
+    }
+
+    /// Alt+D: Delete word after cursor.
+    pub fn delete_word_at_cursor(&mut self) {
+        if self.mode == InputMode::Readonly || self.cursor >= self.text.len() { return; }
+        let rest = &self.text[self.cursor..];
+        let chars: Vec<char> = rest.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            return;
+        }
+        if is_word_char(chars[idx]) {
+            while idx < chars.len() && is_word_char(chars[idx]) {
+                idx += 1;
+            }
+        } else {
+            while idx < chars.len() && !is_word_char(chars[idx]) && !chars[idx].is_whitespace() {
+                idx += 1;
+            }
+        }
+        let delete_end = self.cursor + char_idx_to_byte(rest, idx);
+        if delete_end > self.cursor {
+            self.text.drain(self.cursor..delete_end);
+            self.update_token_estimate();
+            self.kill_ring.mark_non_kill();
+        }
     }
 
     /// Apply a vim command using the full state-machine key handler.
